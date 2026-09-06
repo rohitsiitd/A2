@@ -1,0 +1,3 @@
+#!/bin/sh
+# Market-Data Client launcher: ./client/run-market-data <host> <port> <instrument>
+exec "$(dirname "$0")/../market_data_client" "$@"

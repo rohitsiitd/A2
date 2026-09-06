@@ -1,0 +1,3 @@
+#!/bin/sh
+# Trader Client launcher: ./client/run-trader <host> <port> <username>
+exec "$(dirname "$0")/../trader_client" "$@"

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Exchange Server launcher.
+#
+# experiment.py invokes this as ./server/run-server <host> <port> with the
+# working directory set to the submission root, so the binary is located
+# relative to this script rather than relative to the caller.
+exec "$(dirname "$0")/../exchange_server" "$@"
