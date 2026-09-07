@@ -1,43 +1,21 @@
 /*
- * exchange_server.cpp — the real exchange protocol on top of poll().
- *
- * Concurrency/I/O: poll(), single-threaded, one event loop, no locking —
- * finalized choice (see CLAUDE.md), including for the 70,000-connection
- * bonus. No threads, no kqueue: for idle connections specifically, poll()
- * only costs anything when it wakes up and scans for ready fds, and while
- * genuinely idle it just blocks. The expected bottleneck at that scale is
- * fd/memory limits, not the multiplexing algorithm (see the RLIMIT_NOFILE
- * bump in main()).
- *
- * This revision adds what the earlier version deliberately deferred:
- *   - non-blocking sockets + a per-connection outbound queue (`Client::outq`)
- *     so a slow/dead reader can never make a blocking send() stall the
- *     whole server (Experiment 7's backpressure concern). reply() now goes
- *     through send_or_queue(): try to send immediately; whatever doesn't
- *     fit is queued, and POLLOUT is requested for that fd so the poll loop
- *     is told exactly when there's room to drain more — no busy-looping,
- *     no polling "is it writable yet?" in a spin loop.
- *   - SIGPIPE is ignored process-wide (main()), so a send() to an already-
- *     dead socket returns -1/EPIPE instead of killing the whole server —
- *     handled per-connection like any other send failure (Experiment 8).
- *   - closes are now deferred: mark_for_close() just records an fd; nothing
- *     is actually erased from `clients`/`fds` until a single cleanup pass
- *     after the whole per-tick client loop finishes. This matters because
- *     matching/broadcasting can now fail-and-close a DIFFERENT connection
- *     than the one currently being processed — erasing it immediately
- *     mid-loop (via the old swap-with-last-element trick) could silently
- *     relocate an not-yet-visited entry into an already-visited slot, or
- *     invalidate the very reference the outer loop is using. Deferring
- *     until after the loop sidesteps that entirely: `clients`/`fds` never
- *     mutate structurally while the loop walks them, so every Client&
- *     obtained during a tick stays valid for that whole tick regardless of
- *     how many other connections get marked for closing along the way.
- *
- * Everything else — role inference, command parsing, order storage and
- * matching (BOUGHT/SOLD/TRADE) — is unchanged from the previous revision.
+ * exchange_server.cpp — order matching engine for The Socket Exchange.
  *
  * Usage: ./exchange_server <host> <port>
  *   e.g. ./exchange_server 127.0.0.1 5000
+ *
+ * A single-threaded poll() event loop owns every connection and all exchange
+ * state, so none of it needs locking. Sockets are non-blocking and each
+ * connection carries its own outbound queue, so a peer that stops reading
+ * backs up only its own queue and never delays anybody else.
+ *
+ * Closes are deferred to the end of a tick instead of taken on the spot.
+ * Matching an order can fail a send on a *different* connection from the one
+ * whose message is being processed, and erasing that connection mid-loop
+ * would either relocate a not-yet-visited entry into an already-visited slot
+ * or invalidate the reference the loop is holding. Marking it and sweeping up
+ * afterwards keeps `clients` and `fds` structurally stable for the whole
+ * tick, so any Client& taken during a tick stays valid for that tick.
  */
 
 #include <algorithm>     // std::min
@@ -62,12 +40,11 @@
 
 namespace {
 
-// Generous enough that a sudden burst of connection attempts (e.g. the
-// bonus's client-generator opening tens of thousands of connections) isn't
-// refused just because poll() hasn't gotten back around to accept()ing yet.
+// Deep enough that a burst of simultaneous connection attempts waits in the
+// kernel rather than being refused while the loop is busy elsewhere.
 constexpr int kBacklog = 1024;
-// Sanity cap on unterminated buffered input per connection — not a
-// container limit, just a guard against a client that never sends '\n'.
+// Not a capacity limit — a guard against a peer that connects and then never
+// sends a '\n'.
 constexpr std::size_t kMaxInbufBytes = 4096;
 constexpr std::size_t kRecvChunk = 4096;
 
@@ -85,17 +62,14 @@ std::optional<Instrument> parse_instrument(const std::string &s) {
     return std::nullopt;
 }
 
-// The reverse of parse_instrument: turn our internal enum back into the
-// wire-format token, for building outgoing TRADE/BOUGHT/SOLD messages.
 const char *instrument_name(Instrument inst) {
     return (inst == Instrument::JNST) ? "JNST" : "IMCT";
 }
 
 // --- Small parsing helpers ---------------------------------------------
-// std::from_chars (not std::stoi) because it reports failure without
-// exceptions and tells us exactly where it stopped, the same thing strtol's
-// `end` pointer gave the C version — needed to confirm the WHOLE token was
-// digits, not just a valid prefix of one ("12abc" must be rejected).
+// from_chars rather than stoi: it reports failure without throwing, and the
+// end pointer it hands back lets us insist the WHOLE token was digits rather
+// than just a valid prefix — "12abc" has to be rejected, not read as 12.
 std::optional<int> parse_positive_int(const std::string &s) {
     int value = 0;
     auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
@@ -113,11 +87,10 @@ std::optional<int> parse_nonneg_int(const std::string &s) {
 }
 
 // --- Per-connection state ---------------------------------------------------
-// Keyed by fd in the `clients` map below. client_id is a separate identity
-// from fd: fds get reused by the OS once closed, but an order must always
-// trace back to the exact connection that placed it, even after that fd
-// number gets recycled by a later, unrelated client. `outq` is bytes queued
-// to send but not yet accepted by the kernel — see send_or_queue().
+// client_id is a separate identity from fd because the OS recycles fd numbers
+// as soon as they are closed. An order has to keep pointing at the connection
+// that placed it even after some later, unrelated client inherits that number.
+// `outq` holds bytes handed to us but not yet accepted by the kernel.
 struct Client {
     int fd = -1;
     int client_id = -1;
@@ -129,9 +102,9 @@ struct Client {
 };
 
 // --- Orders ------------------------------------------------------------
-// `open` is true while an order still has unfilled quantity resting in the
-// book, set to false by either a CANCEL or match_order() filling it to 0.
-// A partially-filled order stays open with `qty` reduced to what remains.
+// `open` stays true while unfilled quantity is still resting in the book;
+// either a CANCEL or match_order() filling it to zero clears it. A partial
+// fill leaves the order open with `qty` reduced to the remainder.
 struct Order {
     int id = 0;
     int owner_client_id = 0;
@@ -142,22 +115,18 @@ struct Order {
     bool open = true;
 };
 
-// All of this is central, single-threaded exchange state — no locking
-// needed since one poll() loop is the only thing that ever touches it.
-// `orders` grows via push_back only from BUY/SELL handling, and never
-// while a pointer/reference into it is held across a push_back — that
-// invariant is what keeps Order* from find_open_order() and the Order&
-// passed into match_order() safe to use without becoming dangling.
+// `orders` only ever grows, via push_back from BUY/SELL handling, and never
+// while a reference into it is held across that push_back. That invariant is
+// what keeps the Order* returned by find_open_order() and the Order& handed
+// to match_order() from dangling.
 std::vector<pollfd> fds;
 std::unordered_map<int, Client> clients;  // keyed by fd
 std::vector<Order> orders;
 int next_client_id = 0;
 int next_order_id = 0;
 
-// Connections queued to close once the current tick's client loop finishes
-// (see the big header comment for why this is deferred rather than
-// immediate). May contain the same fd more than once; harmless, the
-// cleanup pass just skips whatever's already gone.
+// Filled during a tick, drained once the client loop finishes. May list the
+// same fd twice; the cleanup pass skips whatever has already gone.
 std::vector<int> pending_close;
 
 void mark_for_close(int fd) {
@@ -180,11 +149,9 @@ Order *find_open_order(int id, int owner_client_id) {
     return nullptr;
 }
 
-// client_id is stable for the connection's whole lifetime, but its slot in
-// `clients` is not (a disconnect erases it outright) — this walks the live
-// clients to find whichever one currently holds that client_id, or nullptr
-// if that trader/subscriber has since disconnected, which a match arriving
-// after they leave must handle gracefully.
+// A client_id outlives its entry in `clients`, since a disconnect erases the
+// entry outright. Returns nullptr once that trader has left, which a match
+// completing after their departure has to tolerate.
 Client *find_client_by_id(int client_id) {
     for (auto &[fd, c] : clients) {
         (void)fd;
@@ -193,12 +160,11 @@ Client *find_client_by_id(int client_id) {
     return nullptr;
 }
 
-// Try to send `data` on `fd` right now; whatever the kernel won't take yet
-// goes into that connection's outq, with POLLOUT requested so the poll
-// loop finds out the moment there's room to drain more. If `outq` is
-// already non-empty, this connection is already backed up — data is just
-// appended, preserving order, without attempting a send at all (avoids
-// sending new bytes ahead of older still-queued ones).
+// Send whatever the kernel will take now; queue the rest and ask for POLLOUT
+// so the loop hears about it the moment there is room for more. When the
+// queue is already non-empty this connection is backed up, so new data is
+// appended without attempting a send — otherwise it would overtake bytes
+// that have been waiting longer.
 void send_or_queue(int fd, const std::string &data) {
     auto it = clients.find(fd);
     if (it == clients.end()) return;  // connection already gone this tick
@@ -214,8 +180,7 @@ void send_or_queue(int fd, const std::string &data) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             n = 0;  // kernel took nothing; queue all of it below
         } else {
-            // EPIPE (peer closed, SIGPIPE ignored in main()), ECONNRESET,
-            // etc. — the peer is gone; let the deferred cleanup handle it.
+            // EPIPE, ECONNRESET and the like: the peer is gone.
             perror("send");
             mark_for_close(fd);
             return;
@@ -231,16 +196,12 @@ void send_or_queue(int fd, const std::string &data) {
     }
 }
 
-// Build one line, append '\n', hand it to send_or_queue(). No va_list/
-// vsnprintf needed in C++: std::string concatenation does the formatting.
 void reply(int fd, const std::string &msg) {
     send_or_queue(fd, msg + "\n");
 }
 
-// Send a TRADE notification to every currently-connected market-data client
-// subscribed to `inst`. Each of these can independently end up queued
-// rather than sent immediately (see send_or_queue) — a slow subscriber no
-// longer blocks delivery to any of the others.
+// Each of these sends can end up queued independently, so one slow subscriber
+// does not hold up delivery to the rest.
 void broadcast_trade(Instrument inst, int qty, int price) {
     for (auto &[fd, c] : clients) {
         if (c.role == Role::MarketData && c.subscribed[static_cast<std::size_t>(inst)]) {
@@ -250,17 +211,16 @@ void broadcast_trade(Instrument inst, int qty, int price) {
     }
 }
 
-// Attempt to match a newly-accepted order `o` against the resting book.
-// `orders` is append-only in acceptance order, so scanning it front-to-back
-// naturally checks the oldest resting orders first (simple FIFO/time
-// priority) before newer ones. The loop keeps trading against successive
-// matches until either `o` is fully filled (o.qty hits 0) or the whole book
-// has been scanned once — a single incoming order can cross several resting
-// orders in one call (e.g. a big BUY eating three small SELLs at the same
-// price). Existing resting orders never need to be re-matched against each
-// other: the invariant is that the book never holds two crossable orders at
-// rest, only ever right after a NEW order arrives, which is exactly when
-// this function runs.
+// Match a newly-accepted order against the resting book. `orders` is
+// append-only in acceptance order, so a front-to-back scan gives the oldest
+// resting orders priority for free. One incoming order can cross several
+// resting ones in a single call — a large BUY eating three small SELLs at the
+// same price — so the loop keeps going until `o` is filled or the book has
+// been walked once.
+//
+// Resting orders never need re-matching against each other: the book only
+// ever holds mutually uncrossable orders at rest, and the only moment that
+// can stop being true is when a new order arrives, which is when this runs.
 void match_order(Order &o) {
     for (auto &other : orders) {
         if (o.qty == 0) break;
@@ -278,11 +238,10 @@ void match_order(Order &o) {
         if (o.qty == 0) o.open = false;
         if (other.qty == 0) other.open = false;
 
-        // BOUGHT/SOLD are private to each order's own owner, not to
-        // whichever connection's incoming message caused this match — so
-        // both lookups are needed, and either owner may already be gone
-        // (they disconnected after placing the resting order); nullptr
-        // here just means there's no one left to notify.
+        // BOUGHT/SOLD go to each order's own owner, not to whoever sent the
+        // message that triggered the match, so both sides need looking up.
+        // Either may have disconnected after placing their order; nullptr
+        // simply means there is nobody left to tell.
         Client *o_owner = find_client_by_id(o.owner_client_id);
         Client *other_owner = find_client_by_id(other.owner_client_id);
         const char *inst_str = instrument_name(o.inst);
@@ -435,18 +394,17 @@ void set_nonblocking(int fd) {
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Set EXCHANGE_DEBUG=1 to trace every recv(). Deliberately an environment
-// variable rather than an argv flag: the experiment harness invokes
-// ./server/run-server with exactly <host> <port> and main() rejects any
-// other argc, so there is nowhere to put a flag without breaking it.
+// EXCHANGE_DEBUG=1 traces every recv(). An environment variable rather than a
+// command-line flag, because the server takes exactly <host> <port> and
+// rejects anything else.
 bool debug_enabled() {
     static const bool on = (std::getenv("EXCHANGE_DEBUG") != nullptr);
     return on;
 }
 
-// Render bytes so framing is visible: a '\n' has to be distinguishable from
-// a line break in the log itself, otherwise the trace can't show where one
-// application message actually ends.
+// A '\n' has to survive into the log as two visible characters. Printed
+// literally it becomes a line break like any other, and the trace can no
+// longer show where one message ends and the next begins.
 std::string escape_bytes(const char *p, std::size_t n) {
     std::string out;
     for (std::size_t i = 0; i < n; i++) {
@@ -474,18 +432,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // A send() to a peer that has already closed its end would otherwise
-    // deliver SIGPIPE, whose default disposition kills the whole process.
-    // Ignoring it means send() just returns -1/EPIPE instead, handled like
-    // any other per-connection send failure in send_or_queue().
+    // A send() to a peer that has already closed would otherwise raise
+    // SIGPIPE, and its default disposition kills the process outright.
+    // Ignoring it turns the same event into EPIPE from send(), which
+    // send_or_queue() handles like any other per-connection failure.
     std::signal(SIGPIPE, SIG_IGN);
 
-    // Bonus: raise this process's fd limit toward its hard ceiling. A
-    // default `ulimit -n` (often ~1024) would otherwise cap accepted
-    // connections far below the 70,000-connection bonus target regardless
-    // of poll() vs. any other I/O model. Best-effort: if the system-wide
-    // ceiling itself is low, this can't exceed it (that needs raising via
-    // sysctl as documented in README.md), so a failure here is not fatal.
+    // A default soft limit of around 1024 descriptors caps concurrent clients
+    // far below what a single event loop can comfortably carry. Best effort:
+    // the hard ceiling and the system-wide limit both still apply, so failing
+    // here is not fatal.
     rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         rl.rlim_cur = rl.rlim_max;
@@ -526,11 +482,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // The accept loop below drains the queue until it is empty, which means
-    // the last accept() of each burst has nothing left to return. On a
-    // blocking listening socket that call would park the whole event loop
-    // until some unrelated client happened to connect; non-blocking makes it
-    // return EWOULDBLOCK instead, which is the loop's termination condition.
+    // The accept loop below drains until the queue is empty, so its last call
+    // of each burst always finds nothing left. On a blocking listener that
+    // call would park the entire event loop until some unrelated client
+    // happened to connect; non-blocking turns it into EWOULDBLOCK, which is
+    // what tells the loop to stop.
     set_nonblocking(listen_fd);
 
     std::printf("exchange_server: listening on %s:%d\n", host, port);
@@ -548,16 +504,16 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // --- New connections. poll() is level-triggered: it reports the
-        // listening socket as readable when at least one connection is
-        // pending, but never says how many. Accepting only one per wake-up
-        // therefore costs a whole poll() cycle -- O(n) over every fd already
-        // in the set -- per connection, so during a burst the drain rate
-        // falls further behind the arrival rate the more clients are already
-        // connected. The kernel's accept queue then overflows (FreeBSD drops
-        // the excess in sonewconn() without sending RST, leaving the peer
-        // ESTABLISHED against a socket that no longer exists). Draining until
-        // EWOULDBLOCK keeps the queue empty regardless of arrival burst size.
+        // --- New connections. poll() is level-triggered: it says the
+        // listener is readable when at least one connection is pending, never
+        // how many. Taking only one per wake-up would spend a full poll()
+        // cycle — O(n) across every registered fd — on each connection, so
+        // during a burst the drain rate falls further behind arrivals the
+        // more clients are already connected. The kernel's accept queue then
+        // overflows, and FreeBSD discards the excess in sonewconn() without
+        // sending RST, leaving those peers ESTABLISHED against a socket that
+        // no longer exists. Draining to EWOULDBLOCK keeps the queue empty
+        // whatever the burst size.
         if (fds[0].revents & POLLIN) {
             for (;;) {
                 sockaddr_in client_addr{};
@@ -572,8 +528,7 @@ int main(int argc, char *argv[]) {
                 if (client_fd < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     // The peer reset between completing the handshake and
-                    // being accepted (the harness's startup probe does this
-                    // deliberately). That kills one pending connection, not
+                    // being accepted. That loses one pending connection, not
                     // the listener, so keep draining the rest of the queue.
                     if (errno == ECONNABORTED || errno == EINTR) continue;
                     perror("accept");
@@ -590,9 +545,9 @@ int main(int argc, char *argv[]) {
                 );
                 std::fflush(stdout);
 
-                // revents is explicitly 0: the scan below skips entries with
-                // no events, so a client accepted this tick is simply picked
-                // up on the next poll() rather than read with a stale mask.
+                // revents starts at 0 so the scan below skips this entry. A
+                // client accepted during this tick gets picked up on the next
+                // poll() rather than read through a stale mask.
                 fds.push_back(pollfd{client_fd, POLLIN, 0});
 
                 Client c;
@@ -603,10 +558,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // --- Existing clients. Neither `fds` nor `clients` is structurally
-        // changed anywhere in this loop (see mark_for_close/pending_close
-        // above) — every Client& obtained here stays valid for the whole
-        // tick no matter what else gets marked for closing along the way.
+        // --- Existing clients. Nothing in this loop changes the structure of
+        // `fds` or `clients`, so every Client& taken here stays valid for the
+        // rest of the tick however many connections get marked for closing.
         for (std::size_t i = 1; i < fds.size(); i++) {
             short revents = fds[i].revents;
             if (revents == 0) continue;
@@ -624,10 +578,9 @@ int main(int argc, char *argv[]) {
                 } else {
                     c.outq.erase(0, static_cast<std::size_t>(n));
                     if (c.outq.empty()) {
-                        // Stop asking for "writable" once there's nothing
-                        // left to write — a drained socket is writable
-                        // almost all the time, so leaving POLLOUT set would
-                        // make poll() wake up on it every single call.
+                        // A drained socket is writable almost all the time,
+                        // so leaving POLLOUT set here would wake poll() on
+                        // this fd every single call.
                         fds[i].events &= ~POLLOUT;
                     }
                 }
@@ -705,7 +658,8 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // --- Deferred cleanup: now safe to actually mutate `fds`/`clients`.
+        // --- The loop is done walking them, so it is safe to mutate
+        // `fds`/`clients` here.
         for (int fd : pending_close) {
             auto it = clients.find(fd);
             if (it == clients.end()) continue;  // already closed this tick

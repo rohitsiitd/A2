@@ -1,31 +1,25 @@
 /*
- * client_generator.cpp — Bonus: open and hold many idle TCP connections to
- * the Exchange Server, for measuring resource usage at scale (up to the
- * 70,000-connection target). Not one of the three required launchers —
- * a standalone tool for the bonus experiment.
+ * client_generator.cpp — open and hold many idle TCP connections to the
+ * Exchange Server, for measuring what a connection costs at scale.
  *
  * Usage: ./client_generator <host> <port> <count> [num_source_ips]
  *   e.g. ./client_generator 127.0.0.1 5000 70000 8
  *
- * A single source IP only has as many usable outbound connections to one
- * destination as its ephemeral port range has ports — on FreeBSD's default
- * range that's on the order of 55,000, short of the 70,000 target by
- * itself. Each (source IP, source port) pair is a distinct identity for an
- * outbound connection, though, so binding across several source addresses
- * (127.0.0.1, 127.0.0.2, ...) gives each one its own independent ephemeral
- * pool.
+ * Connections are opened and then left alone; no data is ever sent. Ctrl-C
+ * closes them all and exits.
  *
- * On FreeBSD those extra addresses must be added explicitly, as root:
+ * One source address reaches a single destination only as many times as it
+ * has ephemeral ports — roughly 55,000 on FreeBSD's default range, which puts
+ * a hard ceiling well under what this tool is meant to reach. An outbound
+ * connection is identified by its (source IP, source port) pair, so spreading
+ * across several source addresses gives each one its own independent pool.
+ *
+ * FreeBSD needs those extra addresses added explicitly, as root:
  *   ifconfig lo0 alias 127.0.0.2 netmask 255.255.255.255   (repeat per IP)
- * lo0 owns only the single address 127.0.0.1 -- its 0xff000000 netmask does
- * NOT make the rest of 127.0.0.0/8 local, and an unaliased 127.0.0.2 falls
- * through to the default route instead, so bind() fails with EADDRNOTAVAIL.
- * (Linux does bind the whole /8 to lo and needs no aliases; this is one of
- * the places the two systems genuinely differ.)
- *
- * Connections are opened and then left alone — no data is ever sent,
- * matching the bonus's "idle connections" requirement. Ctrl-C closes
- * everything and exits.
+ * lo0 owns only 127.0.0.1. Its 0xff000000 netmask does NOT make the rest of
+ * 127.0.0.0/8 local, so an unaliased 127.0.0.2 falls through to the default
+ * route and bind() fails with EADDRNOTAVAIL. Linux binds the whole /8 to lo
+ * and needs none of this — one of the places the two genuinely differ.
  */
 
 #include <arpa/inet.h>   // inet_pton
@@ -74,7 +68,7 @@ int main(int argc, char *argv[]) {
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    raise_fd_limit();  // this process also needs a high fd ceiling to open that many sockets
+    raise_fd_limit();  // every held connection costs this process a descriptor
 
     sockaddr_in dest{};
     dest.sin_family = AF_INET;
@@ -90,9 +84,9 @@ int main(int argc, char *argv[]) {
     long connected = 0;
     long failed = 0;
 
-    // Which call first refused, and why. Without this a failure count alone
-    // is undiagnosable: an exhausted ephemeral port range, an unaliased
-    // source address, and a full listen queue all just look like "failed".
+    // Which call refused first, and why. A bare failure count is
+    // undiagnosable: an exhausted ephemeral port range, an unaliased source
+    // address and a full listen queue all present identically without this.
     int first_socket_errno = 0;
     int first_bind_errno = 0;
     int first_connect_errno = 0;
@@ -106,9 +100,8 @@ int main(int argc, char *argv[]) {
         }
 
         if (num_source_ips > 1) {
-            // Cycle the source address through 127.0.0.1, 127.0.0.2, ...
-            // so each gets its own independent ephemeral-port pool instead
-            // of all connections competing for one shared pool.
+            // Cycle through 127.0.0.1, 127.0.0.2, ... so the connections draw
+            // on several ephemeral-port pools rather than exhausting one.
             sockaddr_in src{};
             src.sin_family = AF_INET;
             src.sin_port = 0;  // let the kernel pick a free port for this address

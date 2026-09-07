@@ -8,15 +8,13 @@
  * loop: lines typed on stdin are sent as commands (BUY/SELL/CANCEL/QUIT),
  * and lines from the server are printed as they arrive.
  *
- * The protocol is explicit that server messages are asynchronous (section
- * 2.7): a BOUGHT/SOLD notification can arrive at any time, not just right
- * after this trader's own request, because it fires when some OTHER
- * trader's order matches this one. A client that did a strict "send a
- * command, then recv() the reply" cycle per typed line — the way
- * echo_client.cpp does — would miss any notification that arrives while
- * it's sitting at the keyboard waiting for the next line to be typed.
- * So this client poll()s TWO fds at once, stdin and the socket, and reacts
- * to whichever one has something first, independent of the other.
+ * Server messages are asynchronous. A BOUGHT/SOLD notification fires when
+ * some *other* trader's order crosses one of ours, so it can land at any
+ * moment rather than as the answer to something we just sent. A client built
+ * around a strict send-then-recv cycle per typed line would sit blocked at
+ * the keyboard and not see those until the user happened to type again.
+ * Polling stdin and the socket together lets each be handled the moment it
+ * has something, independent of the other.
  */
 
 #include <arpa/inet.h>   // inet_pton
@@ -85,8 +83,7 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Server -> us: buffer and frame on '\n', same reasoning as the
-        // server side — one recv() is not one message.
+        // One recv() is not one message, so buffer and split on '\n'.
         if (fds[1].revents & POLLIN) {
             char chunk[kRecvChunk];
             ssize_t n = recv(sock_fd, chunk, sizeof(chunk), 0);
@@ -112,15 +109,13 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Us -> server: one line of stdin per poll() wakeup is fine here —
-        // unlike the TCP socket, stdin is a terminal delivering
-        // line-buffered input, so a single getline() reliably returns
-        // exactly what the user just typed and pressed Enter on.
+        // One line per wake-up is enough here: stdin is a terminal handing us
+        // line-buffered input, so a single getline() returns exactly what the
+        // user typed before pressing Enter. The socket needs no such luck.
         if (fds[0].revents & POLLIN) {
             std::string line;
             if (!std::getline(std::cin, line)) {
-                // EOF (Ctrl-D): leave gracefully rather than just vanishing.
-               break;
+                break;  // Ctrl-D
             }
             std::string out = line + "\n";
             if (send(sock_fd, out.data(), out.size(), 0) < 0) {

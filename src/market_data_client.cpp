@@ -5,10 +5,13 @@
  *   e.g. ./market_data_client 127.0.0.1 5000 JNST
  *
  * Connects, sends SUBSCRIBE <instrument> automatically, then prints TRADE
- * updates as they arrive. Same dual-poll structure as trader_client.cpp —
- * stdin and the socket are watched independently — so typing UNSUBSCRIBE
- * or SUBSCRIBE to another instrument still works interactively without
- * blocking the delivery of incoming TRADE messages, and vice versa.
+ * updates as they arrive.
+ *
+ * TRADE messages are pushed by the server whenever a matching order executes,
+ * with nothing on this end having asked for them. Polling stdin and the
+ * socket together means those keep arriving and printing while the user sits
+ * mid-command, and that typing SUBSCRIBE or UNSUBSCRIBE never has to wait for
+ * a quiet moment on the socket.
  */
 
 #include <arpa/inet.h>   // inet_pton
@@ -77,6 +80,7 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        // One recv() is not one message, so buffer and split on '\n'.
         if (fds[1].revents & POLLIN) {
             char chunk[kRecvChunk];
             ssize_t n = recv(sock_fd, chunk, sizeof(chunk), 0);
